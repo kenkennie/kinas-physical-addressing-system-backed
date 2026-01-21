@@ -53,6 +53,333 @@ export class LandParcelService {
     return result[0]?.tile || Buffer.alloc(0);
   }
 
+  async getParcelDetailsByLatLng(lat: number, lng: number) {
+    const gid = await this.resolveParcelGidByLatLng(lat, lng);
+    return this.getParcelContextByGid(gid);
+  }
+
+  private async resolveParcelGidByLatLng(
+    lat: number,
+    lng: number,
+  ): Promise<number> {
+    const result = await this.parcelRepo.query(
+      `
+    SELECT gid
+    FROM land_parcel
+    WHERE ST_Intersects(
+      geom,
+      ST_Buffer(
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+        1
+      )::geometry
+    )
+    LIMIT 1;
+    `,
+      [lng, lat],
+    );
+
+    if (!result[0]) {
+      throw new NotFoundException('No parcel found at this location');
+    }
+
+    return result[0].gid;
+  }
+
+  public async getParcelContextByGid(gid: number) {
+    const result = await this.parcelRepo.query(
+      `
+    WITH parcel_info AS (
+      SELECT
+        gid,
+        lr_no,
+        fr_no,
+        CAST(area AS FLOAT) AS area,
+        entity,
+        geom,
+        ST_Y(ST_Centroid(geom)) AS centroid_lat,
+        ST_X(ST_Centroid(geom)) AS centroid_lng
+      FROM land_parcel
+      WHERE gid = $1
+      LIMIT 1
+    ),
+
+    parcel_entries AS (
+      SELECT
+        e.gid,
+        e.label,
+        e.geom,
+        ST_Y(e.geom) AS lat,
+        ST_X(e.geom) AS lng,
+        ROUND(ST_Distance(e.geom::geography, p.geom::geography)::numeric, 2) AS distance_to_parcel
+      FROM entry_points e
+      CROSS JOIN parcel_info p
+      WHERE ST_DWithin(e.geom::geography, p.geom::geography, 5)
+      ORDER BY ST_Distance(e.geom::geography, p.geom::geography)
+    ),
+
+    entry_roads AS (
+      SELECT
+        pe.gid AS entry_gid,
+        r.gid AS road_gid,
+        r.name,
+        r.fclass,
+        r.ref,
+        ROUND(ST_Distance(r.geom::geography, pe.geom::geography)::numeric, 2) AS distance_meters,
+        ROW_NUMBER() OVER (
+          PARTITION BY pe.gid
+          ORDER BY ST_Distance(r.geom::geography, pe.geom::geography)
+        ) rn
+      FROM parcel_entries pe
+      JOIN roads r
+        ON ST_DWithin(r.geom::geography, pe.geom::geography, 50)
+    ),
+
+    admin_block AS (
+      SELECT a.gid, a.name, a.constituen, a.county_nam
+      FROM administrative_block a, parcel_info p
+      WHERE ST_Intersects(a.geom, p.geom)
+      LIMIT 1
+    )
+
+    SELECT jsonb_build_object(
+      'parcel', jsonb_build_object(
+        'gid', p.gid,
+        'lr_no', p.lr_no,
+        'fr_no', p.fr_no,
+        'area', p.area,
+        'entity', p.entity,
+        'centroid', jsonb_build_object(
+          'lat', p.centroid_lat,
+          'lng', p.centroid_lng
+        )
+      ),
+      'administrative_block', (SELECT row_to_json(admin_block.*) FROM admin_block),
+      'entry_points', (
+        SELECT COALESCE(jsonb_agg(
+          jsonb_build_object(
+            'gid', pe.gid,
+            'label', pe.label,
+            'coordinates', jsonb_build_object('lat', pe.lat, 'lng', pe.lng),
+            'distance_to_parcel_meters', pe.distance_to_parcel,
+            'nearest_roads', (
+              SELECT COALESCE(jsonb_agg(
+                jsonb_build_object(
+                  'gid', er.road_gid,
+                  'name', er.name,
+                  'fclass', er.fclass,
+                  'ref', er.ref,
+                  'distance_meters', er.distance_meters
+                )
+                ORDER BY er.distance_meters
+              ), '[]'::jsonb)
+              FROM entry_roads er
+              WHERE er.entry_gid = pe.gid AND er.rn <= 3
+            )
+          )
+        ), '[]'::jsonb)
+        FROM parcel_entries pe
+      )
+    ) AS result
+    FROM parcel_info p;
+    `,
+      [gid],
+    );
+
+    return result[0]?.result;
+  }
+
+  // async getParcelDetailsByLatLng(lat: number, lng: number) {
+  //   try {
+  //     /* ----------------------------------------------------
+  //      * 1. Find parcel at click point (with small buffer)
+  //      * -------------------------------------------------- */
+  //     const parcelResult = await this.parcelRepo.query(
+  //       `
+  //         SELECT gid, lr_no, ST_AsText(geom) as geom_text
+  //         FROM land_parcel
+  //         WHERE ST_Intersects(
+  //           geom,
+  //           ST_Buffer(
+  //             ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+  //             1  -- 1 meter tolerance
+  //           )::geometry
+  //         )
+  //         LIMIT 1;
+  //         `,
+  //       [lng, lat],
+  //     );
+
+  //     if (!parcelResult[0]) {
+  //       throw new NotFoundException('No parcel found at this location');
+  //     }
+
+  //     const gid = parcelResult[0].gid;
+
+  //     /* ----------------------------------------------------
+  //      * 2. Parcel details + centroid
+  //      * -------------------------------------------------- */
+  //     const parcelData = await this.parcelRepo.query(
+  //       `
+  //       SELECT
+  //         gid,
+  //         lr_no,
+  //         fr_no,
+  //         CAST(area AS FLOAT) AS area,
+  //         entity,
+  //         ST_AsGeoJSON(geom) AS geometry,
+  //         ST_Y(ST_Centroid(geom)) AS centroid_lat,
+  //         ST_X(ST_Centroid(geom)) AS centroid_lng
+  //       FROM land_parcel
+  //       WHERE gid = $1;
+  //       `,
+  //       [gid],
+  //     );
+
+  //     /* ----------------------------------------------------
+  //      * 3. Administrative block
+  //      * -------------------------------------------------- */
+  //     let adminResult = await this.parcelRepo.query(
+  //       `
+  //       SELECT
+  //         a.gid,
+  //         a.name,
+  //         a.constituen,
+  //         a.county_nam
+  //       FROM administrative_block a, land_parcel p
+  //       WHERE p.gid = $1
+  //         AND ST_Intersects(a.geom, p.geom)
+  //       LIMIT 1;
+  //       `,
+  //       [gid],
+  //     );
+
+  //     // If no intersection, find nearest admin block
+  //     if (!adminResult[0]) {
+  //       adminResult = await this.parcelRepo.query(
+  //         `
+  //         SELECT
+  //           a.gid,
+  //           a.name,
+  //           a.constituen,
+  //           a.county_nam,
+  //           CAST(ROUND(ST_Distance(a.geom::geography, p.geom::geography)::numeric, 2) AS FLOAT) as distance_meters
+  //         FROM administrative_block a, land_parcel p
+  //         WHERE p.gid = $1
+  //         ORDER BY a.geom <-> p.geom
+  //         LIMIT 1;
+  //         `,
+  //         [gid],
+  //       );
+  //     }
+
+  //     /* ----------------------------------------------------
+  //      * 4. Entry points WITH their nearest roads
+  //      * -------------------------------------------------- */
+  //     const entryPointsWithRoads = await this.parcelRepo.query(
+  //       `
+  //       WITH parcel_entries AS (
+  //         -- Find entry points within or near the parcel
+  //         SELECT
+  //           e.gid,
+  //           e.label,
+  //           e.geom,
+  //           ST_Y(e.geom) AS lat,
+  //           ST_X(e.geom) AS lng,
+  //           CAST(ROUND(ST_Distance(e.geom::geography, p.geom::geography)::numeric, 2) AS FLOAT) AS distance_to_parcel
+  //         FROM entry_points e
+  //         CROSS JOIN land_parcel p
+  //         WHERE p.gid = $1
+  //           AND ST_DWithin(e.geom::geography, p.geom::geography, 5) -- within 5m
+  //         ORDER BY ST_Distance(e.geom::geography, p.geom::geography)
+  //       ),
+  //       entry_roads AS (
+  //         -- For each entry point, find closest roads
+  //         SELECT
+  //           pe.gid as entry_gid,
+  //           pe.label,
+  //           pe.lat,
+  //           pe.lng,
+  //           pe.distance_to_parcel,
+  //           r.gid as road_gid,
+  //           r.name as road_name,
+  //           r.fclass as road_class,
+  //           r.ref as road_ref,
+  //           CAST(ROUND(ST_Distance(r.geom::geography, pe.geom::geography)::numeric, 2) AS FLOAT) as distance_to_road,
+  //           ROW_NUMBER() OVER (
+  //             PARTITION BY pe.gid
+  //             ORDER BY ST_Distance(r.geom::geography, pe.geom::geography)
+  //           ) as rn
+  //         FROM parcel_entries pe
+  //         CROSS JOIN roads r
+  //         WHERE r.name IS NOT NULL
+  //           AND ST_DWithin(r.geom::geography, pe.geom::geography, 50) -- roads within 0m of entry
+  //       )
+  //       SELECT
+  //         entry_gid,
+  //         label,
+  //         lat,
+  //         lng,
+  //         distance_to_parcel,
+  //         jsonb_agg(
+  //           jsonb_build_object(
+  //             'gid', road_gid,
+  //             'name', road_name,
+  //             'fclass', road_class,
+  //             'ref', road_ref,
+  //             'distance_meters', distance_to_road
+  //           )
+  //           ORDER BY distance_to_road
+  //         ) as nearest_roads
+  //       FROM entry_roads
+  //       WHERE rn <= 3  -- Top 3 closest roads per entry point
+  //       GROUP BY entry_gid, label, lat, lng, distance_to_parcel
+  //       ORDER BY distance_to_parcel;
+  //       `,
+  //       [gid],
+  //     );
+
+  //     /* ----------------------------------------------------
+  //      * 5. Final response
+  //      * -------------------------------------------------- */
+
+  //     const response = {
+  //       parcel: {
+  //         gid: parcelData[0].gid,
+  //         lr_no: parcelData[0].lr_no,
+  //         fr_no: parcelData[0].fr_no,
+  //         area: parcelData[0].area,
+  //         entity: parcelData[0].entity,
+  //         centroid: {
+  //           lat: parcelData[0].centroid_lat,
+  //           lng: parcelData[0].centroid_lng,
+  //         },
+  //         latlng: { lat, lng },
+  //         geometry: JSON.parse(parcelData[0].geometry),
+  //       },
+  //       administrative_block: adminResult[0] || null,
+  //       entry_points: entryPointsWithRoads.map((ep) => ({
+  //         gid: ep.entry_gid,
+  //         label: ep.label,
+  //         coordinates: {
+  //           lat: ep.lat,
+  //           lng: ep.lng,
+  //         },
+  //         distance_to_parcel_meters: ep.distance_to_parcel,
+  //         nearest_roads: ep.nearest_roads,
+  //       })),
+  //     };
+
+  //     // console.log('API Response:', JSON.stringify(response, null, 2));
+
+  //     return response;
+  //   } catch (err) {
+  //     console.error('Spatial Query Error:', err);
+  //     throw new InternalServerErrorException(
+  //       'Spatial data error: ' + err.message,
+  //     );
+  //   }
+  // }
+
   async findParcelGidAtPoint(lat: number, lng: number): Promise<number> {
     // We cast to geography to ensure accurate point-in-polygon check
     const result = await this.parcelRepo.query(
@@ -67,196 +394,6 @@ export class LandParcelService {
 
     if (!result[0]) throw new NotFoundException('No parcel found here');
     return result[0].gid;
-  }
-
-  async getParcelDetailsByLatLng(lat: number, lng: number) {
-    try {
-      /* ----------------------------------------------------
-       * 1. Find parcel at click point (with small buffer)
-       * -------------------------------------------------- */
-      const parcelResult = await this.parcelRepo.query(
-        `
-          SELECT gid, lr_no, ST_AsText(geom) as geom_text
-          FROM land_parcel
-          WHERE ST_Intersects(
-            geom,
-            ST_Buffer(
-              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-              1  -- 1 meter tolerance
-            )::geometry
-          )
-          LIMIT 1;
-          `,
-        [lng, lat],
-      );
-
-      if (!parcelResult[0]) {
-        throw new NotFoundException('No parcel found at this location');
-      }
-
-      const gid = parcelResult[0].gid;
-
-      /* ----------------------------------------------------
-       * 2. Parcel details + centroid
-       * -------------------------------------------------- */
-      const parcelData = await this.parcelRepo.query(
-        `
-        SELECT
-          gid,
-          lr_no,
-          fr_no,
-          CAST(area AS FLOAT) AS area,
-          entity,
-          ST_AsGeoJSON(geom) AS geometry,
-          ST_Y(ST_Centroid(geom)) AS centroid_lat,
-          ST_X(ST_Centroid(geom)) AS centroid_lng
-        FROM land_parcel
-        WHERE gid = $1;
-        `,
-        [gid],
-      );
-
-      /* ----------------------------------------------------
-       * 3. Administrative block
-       * -------------------------------------------------- */
-      let adminResult = await this.parcelRepo.query(
-        `
-        SELECT 
-          a.gid,
-          a.name, 
-          a.constituen, 
-          a.county_nam
-        FROM administrative_block a, land_parcel p
-        WHERE p.gid = $1
-          AND ST_Intersects(a.geom, p.geom)
-        LIMIT 1;
-        `,
-        [gid],
-      );
-
-      // If no intersection, find nearest admin block
-      if (!adminResult[0]) {
-        adminResult = await this.parcelRepo.query(
-          `
-          SELECT 
-            a.gid,
-            a.name, 
-            a.constituen, 
-            a.county_nam,
-            CAST(ROUND(ST_Distance(a.geom::geography, p.geom::geography)::numeric, 2) AS FLOAT) as distance_meters
-          FROM administrative_block a, land_parcel p
-          WHERE p.gid = $1
-          ORDER BY a.geom <-> p.geom
-          LIMIT 1;
-          `,
-          [gid],
-        );
-      }
-
-      /* ----------------------------------------------------
-       * 4. Entry points WITH their nearest roads
-       * -------------------------------------------------- */
-      const entryPointsWithRoads = await this.parcelRepo.query(
-        `
-        WITH parcel_entries AS (
-          -- Find entry points within or near the parcel
-          SELECT
-            e.gid,
-            e.label,
-            e.geom,
-            ST_Y(e.geom) AS lat,
-            ST_X(e.geom) AS lng,
-            CAST(ROUND(ST_Distance(e.geom::geography, p.geom::geography)::numeric, 2) AS FLOAT) AS distance_to_parcel
-          FROM entry_points e
-          CROSS JOIN land_parcel p
-          WHERE p.gid = $1
-            AND ST_DWithin(e.geom::geography, p.geom::geography, 5) -- within 5m
-          ORDER BY ST_Distance(e.geom::geography, p.geom::geography)
-        ),
-        entry_roads AS (
-          -- For each entry point, find closest roads
-          SELECT
-            pe.gid as entry_gid,
-            pe.label,
-            pe.lat,
-            pe.lng,
-            pe.distance_to_parcel,
-            r.gid as road_gid,
-            r.name as road_name,
-            r.fclass as road_class,
-            r.ref as road_ref,
-            CAST(ROUND(ST_Distance(r.geom::geography, pe.geom::geography)::numeric, 2) AS FLOAT) as distance_to_road,
-            ROW_NUMBER() OVER (
-              PARTITION BY pe.gid 
-              ORDER BY ST_Distance(r.geom::geography, pe.geom::geography)
-            ) as rn
-          FROM parcel_entries pe
-          CROSS JOIN roads r
-          WHERE r.name IS NOT NULL
-            AND ST_DWithin(r.geom::geography, pe.geom::geography, 50) -- roads within 0m of entry
-        )
-        SELECT
-          entry_gid,
-          label,
-          lat,
-          lng,
-          distance_to_parcel,
-          jsonb_agg(
-            jsonb_build_object(
-              'gid', road_gid,
-              'name', road_name,
-              'fclass', road_class,
-              'ref', road_ref,
-              'distance_meters', distance_to_road
-            )
-            ORDER BY distance_to_road
-          ) as nearest_roads
-        FROM entry_roads
-        WHERE rn <= 3  -- Top 3 closest roads per entry point
-        GROUP BY entry_gid, label, lat, lng, distance_to_parcel
-        ORDER BY distance_to_parcel;
-        `,
-        [gid],
-      );
-
-      /* ----------------------------------------------------
-       * 5. Final response
-       * -------------------------------------------------- */
-      const response = {
-        parcel: {
-          gid: parcelData[0].gid,
-          lr_no: parcelData[0].lr_no,
-          fr_no: parcelData[0].fr_no,
-          area: parcelData[0].area,
-          entity: parcelData[0].entity,
-          centroid: {
-            lat: parcelData[0].centroid_lat,
-            lng: parcelData[0].centroid_lng,
-          },
-          geometry: JSON.parse(parcelData[0].geometry),
-        },
-        administrative_block: adminResult[0] || null,
-        entry_points: entryPointsWithRoads.map((ep) => ({
-          gid: ep.entry_gid,
-          label: ep.label,
-          coordinates: {
-            lat: ep.lat,
-            lng: ep.lng,
-          },
-          distance_to_parcel_meters: ep.distance_to_parcel,
-          nearest_roads: ep.nearest_roads,
-        })),
-      };
-
-      console.log('API Response:', JSON.stringify(response, null, 2));
-
-      return response;
-    } catch (err) {
-      console.error('Spatial Query Error:', err);
-      throw new InternalServerErrorException(
-        'Spatial data error: ' + err.message,
-      );
-    }
   }
 
   async getAllParcels(page: number = 1, limit: number = 50) {

@@ -1,5 +1,6 @@
 import {
   IsEnum,
+  IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
@@ -22,18 +23,31 @@ export class CoordinateDto {
   lng: number;
 }
 
-export class RouteRequestDto {
-  @ValidateNested()
-  @Type(() => CoordinateDto)
+export class CalculateRouteDto {
+  @IsNotEmpty()
+  gid: number;
+
+  @IsNotEmpty()
   origin: CoordinateDto;
 
-  @IsString()
-  destination_lr_no: string; // Parcel LR number
+  @IsNotEmpty()
+  destination_lr_no: string;
 
   @IsEnum(TransportMode)
   mode: TransportMode;
 
   @IsOptional()
   @IsNumber()
-  preferred_entry_point?: number; // Entry point label
+  preferred_entry_point?: number; // Entry point GID
+}
+
+export class AlternativeRoutesDto {
+  @IsNotEmpty()
+  origin: CoordinateDto;
+
+  @IsNotEmpty()
+  destination_lr_no: string;
+
+  @IsEnum(TransportMode)
+  mode: TransportMode;
 }

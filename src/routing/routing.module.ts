@@ -1,18 +1,16 @@
+// src/routing/routing.module.ts
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { RoutingService } from './routing.service';
 import { RoutingController } from './routing.controller';
+import { RoutingService } from './routing.service';
 import { LandParcel } from '../land-parcel/entities/land-parcel.entity';
-import { EntryPoint } from '../entry-points/entities/entry-point.entity';
-import { Road } from '../roads/entities/road.entity';
+import { LandParcelService } from 'src/land-parcel/land-parcel.service';
 import { AddressModule } from '../address/address.module';
 
 @Module({
-  imports: [
-    TypeOrmModule.forFeature([LandParcel, EntryPoint, Road]),
-    AddressModule,
-  ],
+  imports: [TypeOrmModule.forFeature([LandParcel]), AddressModule],
   controllers: [RoutingController],
-  providers: [RoutingService],
+  providers: [RoutingService, LandParcelService],
+  exports: [RoutingService],
 })
 export class RoutingModule {}
