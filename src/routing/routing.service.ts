@@ -7,71 +7,80 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { LandParcel } from '../land-parcel/entities/land-parcel.entity';
+import { EntryPoint } from '../entry-points/entities/entry-point.entity';
+import { AdministrativeBlock } from '../administrative-block/entities/administrative-block.entity';
+import { MapboxService } from './mapbox.service';
 import {
   CalculateRouteDto,
   AlternativeRoutesDto,
   TransportMode,
-} from '../routing/dto/routing.dto';
-import { LandParcelService } from 'src/land-parcel/land-parcel.service';
+} from './dto/routing.dto';
+import {
+  RouteSegment,
+  RouteInstruction,
+  RouteResponse,
+} from './types/route.types';
 
 @Injectable()
 export class RoutingService {
   constructor(
     @InjectRepository(LandParcel)
     private readonly parcelRepo: Repository<LandParcel>,
-    private readonly landParcelService: LandParcelService,
+    @InjectRepository(EntryPoint)
+    private readonly entryPointRepo: Repository<EntryPoint>,
+    @InjectRepository(AdministrativeBlock)
+    private readonly adminBlockRepo: Repository<AdministrativeBlock>,
+    private readonly mapboxService: MapboxService,
   ) {}
 
   /**
-   * Calculate a single route to a parcel
+   * Calculate route with real-time traffic and road conditions
    */
-  async calculateRoute(dto: CalculateRouteDto) {
-    const { origin, gid, mode, preferred_entry_point } = dto;
+  async calculateRoute(dto: CalculateRouteDto): Promise<RouteResponse> {
+    const { origin, destination_lr_no, mode, preferred_entry_point } = dto;
 
-    // 1. Get parcel details with entry points
-    const parcelData = await this.landParcelService.getParcelContextByGid(gid);
+    // 1. Get parcel with entry points
+    const parcelData = await this.getParcelWithEntryPoints(destination_lr_no);
 
-    if (parcelData.entry_points.length === 0) {
-      throw new BadRequestException('Parcel has no entry points');
+    if (!parcelData || parcelData.entry_points.length === 0) {
+      throw new NotFoundException('Parcel or entry points not found');
     }
 
     // 2. Select entry point
-    let selectedEntry;
+    let selectedEntry = parcelData.entry_points[0];
     if (preferred_entry_point) {
-      selectedEntry = parcelData.entry_points.find(
-        (ep) => ep.gid === preferred_entry_point,
-      );
-      if (!selectedEntry) {
-        throw new NotFoundException('Specified entry point not found');
-      }
-    } else {
-      // Find closest entry point to origin
-      selectedEntry = await this.findClosestEntryPoint(
-        origin,
-        parcelData.entry_points,
-      );
-      console.log('===================selectedEntry=================');
-      console.log(selectedEntry);
-      console.log('===================selectedEntry=================');
+      selectedEntry =
+        parcelData.entry_points.find(
+          (ep) => ep.gid === preferred_entry_point,
+        ) || selectedEntry;
     }
 
-    // 3. Get route from origin to entry point
-    const route = await this.calculateRouteToEntryPoint(
+    // 3. Get Mapbox route to entry point
+    const mapboxRoute = await this.mapboxService.getRoute(
       origin,
-      selectedEntry,
+      selectedEntry.coordinates,
       mode,
     );
 
-    // 4. Get access road for the entry point
-    const accessRoad = selectedEntry.nearest_roads[0] || null;
+    const primaryRoute = mapboxRoute.routes[0];
 
-    // 5. Generate turn-by-turn instructions
-    const instructions = this.generateInstructions(
-      route.segments,
+    // 4. Build route response with Mapbox data
+    const segments = await this.buildRouteSegments(primaryRoute, selectedEntry);
+    const instructions = this.buildInstructions(
+      primaryRoute,
       selectedEntry,
       parcelData.parcel,
-      mode,
     );
+
+    // 5. Get access road info
+    const accessRoad = selectedEntry.nearest_roads[0] || null;
+
+    // 6. Extract traffic and annotation data safely
+    const leg = primaryRoute.legs[0];
+    const annotation = leg?.annotation as any;
+    const congestionData = Array.isArray(annotation)
+      ? annotation.find((a: any) => a.congestion)?.congestion
+      : annotation?.congestion;
 
     return {
       destination: {
@@ -91,9 +100,12 @@ export class RoutingService {
         ),
       },
       route: {
-        segments: route.segments,
-        total_distance: route.total_distance,
+        segments,
+        total_distance: primaryRoute.distance,
+        total_duration: primaryRoute.duration,
         mode: mode,
+        has_traffic: true,
+        traffic_level: this.getTrafficLevel(congestionData),
         entry_point: {
           lat: selectedEntry.coordinates.lat,
           lng: selectedEntry.coordinates.lng,
@@ -105,461 +117,274 @@ export class RoutingService {
   }
 
   /**
-   * Get alternative routes using different entry points
+   * Get alternative routes for different entry points
    */
-  async getAlternativeRoutes(dto: AlternativeRoutesDto) {
+  async getAlternativeRoutes(
+    dto: AlternativeRoutesDto,
+  ): Promise<RouteResponse[]> {
     const { origin, destination_lr_no, mode } = dto;
 
-    // Get parcel with all entry points
     const parcelData = await this.getParcelWithEntryPoints(destination_lr_no);
 
-    if (!parcelData) {
-      throw new NotFoundException(`Parcel ${destination_lr_no} not found`);
-    }
-
-    if (parcelData.entry_points.length === 0) {
-      throw new BadRequestException('Parcel has no entry points');
+    if (!parcelData || parcelData.entry_points.length === 0) {
+      throw new NotFoundException('Parcel or entry points not found');
     }
 
     // Calculate route for each entry point
     const routes = await Promise.all(
       parcelData.entry_points.map(async (entry) => {
-        const route = await this.calculateRouteToEntryPoint(
-          origin,
-          entry,
-          mode,
-        );
-        const accessRoad = entry.nearest_roads[0] || null;
-        const instructions = this.generateInstructions(
-          route.segments,
-          entry,
-          parcelData.parcel,
-          mode,
-        );
+        try {
+          const mapboxRoute = await this.mapboxService.getRoute(
+            origin,
+            entry.coordinates,
+            mode,
+          );
 
-        return {
-          destination: {
-            parcel: parcelData.parcel,
-            entry_point: {
-              gid: entry.gid,
-              label: entry.label,
-              coordinates: entry.coordinates,
-              distance_to_parcel_meters: entry.distance_to_parcel_meters,
-              nearest_roads: entry.nearest_roads,
+          const primaryRoute = mapboxRoute.routes[0];
+          const segments = await this.buildRouteSegments(primaryRoute, entry);
+          const instructions = this.buildInstructions(
+            primaryRoute,
+            entry,
+            parcelData.parcel,
+          );
+          const accessRoad = entry.nearest_roads[0] || null;
+
+          const leg = primaryRoute.legs[0];
+          const annotation = leg?.annotation as any;
+          const congestionData = Array.isArray(annotation)
+            ? annotation.find((a: any) => a.congestion)?.congestion
+            : annotation?.congestion;
+
+          return {
+            destination: {
+              parcel: parcelData.parcel,
+              entry_point: {
+                gid: entry.gid,
+                label: entry.label,
+                coordinates: entry.coordinates,
+                distance_to_parcel_meters: entry.distance_to_parcel_meters,
+                nearest_roads: entry.nearest_roads,
+              },
+              access_road: accessRoad,
+              physical_address: this.generatePhysicalAddress(
+                parcelData.parcel,
+                parcelData.administrative_block,
+                accessRoad,
+              ),
             },
-            access_road: accessRoad,
-            physical_address: this.generatePhysicalAddress(
-              parcelData.parcel,
-              parcelData.administrative_block,
-              accessRoad,
-            ),
-          },
-          route: {
-            segments: route.segments,
-            total_distance: route.total_distance,
-            mode: mode,
-            entry_point: {
-              lat: entry.coordinates.lat,
-              lng: entry.coordinates.lng,
-              label: entry.label,
+            route: {
+              segments,
+              total_distance: primaryRoute.distance,
+              total_duration: primaryRoute.duration,
+              mode: mode,
+              has_traffic: true,
+              traffic_level: this.getTrafficLevel(congestionData),
+              entry_point: {
+                lat: entry.coordinates.lat,
+                lng: entry.coordinates.lng,
+                label: entry.label,
+              },
             },
-          },
-          instructions,
-        };
+            instructions,
+          };
+        } catch (error) {
+          console.error(
+            `Failed to calculate route for entry ${entry.gid}:`,
+            error,
+          );
+          return null;
+        }
       }),
     );
 
-    // Sort by total distance (shortest first)
-    return routes.sort(
-      (a, b) => a.route.total_distance - b.route.total_distance,
-    );
+    // Filter out failed routes and sort by distance
+    return routes
+      .filter((route): route is RouteResponse => route !== null)
+      .sort((a, b) => a.route.total_distance - b.route.total_distance);
   }
 
   /**
-   * Get parcel with entry points and admin block
+   * Build route segments from Mapbox response
    */
-  private async getParcelWithEntryPoints(lr_no: string) {
-    const result = await this.parcelRepo.query(
-      `
-      WITH parcel_info AS (
-        SELECT 
-          gid,
-          lr_no,
-          fr_no,
-          CAST(area AS FLOAT) AS area,
-          entity,
-          geom
-        FROM land_parcel
-        WHERE lr_no = $1
-        LIMIT 1
-      ),
-      
-      parcel_entries AS (
-        SELECT
-          e.gid,
-          e.label,
-          e.geom,
-          ST_Y(e.geom) AS lat,
-          ST_X(e.geom) AS lng,
-          ROUND(ST_Distance(e.geom::geography, p.geom::geography)::numeric, 2) AS distance_to_parcel
-        FROM entry_points e
-        CROSS JOIN parcel_info p
-        WHERE ST_DWithin(e.geom::geography, p.geom::geography, 500)
-        ORDER BY ST_Distance(e.geom::geography, p.geom::geography)
-      ),
-      entry_roads AS (
-        SELECT
-          pe.gid as entry_gid,
-          r.gid as road_gid,
-          r.name as road_name,
-          r.fclass as road_class,
-          r.ref as road_ref,
-          ROUND(ST_Distance(r.geom::geography, pe.geom::geography)::numeric, 2) as distance_to_road,
-          ROW_NUMBER() OVER (
-            PARTITION BY pe.gid 
-            ORDER BY ST_Distance(r.geom::geography, pe.geom::geography)
-          ) as rn
-        FROM parcel_entries pe
-        CROSS JOIN roads r
-        WHERE r.name IS NOT NULL
-          AND ST_DWithin(r.geom::geography, pe.geom::geography, 200)
-      ),
-      admin_block AS (
-        SELECT 
-          a.name, 
-          a.constituen, 
-          a.county_nam
-        FROM administrative_block a, parcel_info p
-        WHERE ST_Intersects(a.geom, p.geom)
-        LIMIT 1
-      )
-      SELECT 
-        jsonb_build_object(
-          'parcel', (SELECT row_to_json(parcel_info.*) FROM parcel_info),
-          'entry_points', (
-            SELECT COALESCE(jsonb_agg(
-              jsonb_build_object(
-                'gid', pe.gid,
-                'label', pe.label,
-                'coordinates', jsonb_build_object('lat', pe.lat, 'lng', pe.lng),
-                'distance_to_parcel_meters', pe.distance_to_parcel,
-                'nearest_roads', (
-                  SELECT COALESCE(jsonb_agg(
-                    jsonb_build_object(
-                      'gid', er.road_gid,
-                      'name', er.road_name,
-                      'fclass', er.road_class,
-                      'ref', er.road_ref,
-                      'distance_meters', er.distance_to_road
-                    )
-                    ORDER BY er.distance_to_road
-                  ), '[]'::jsonb)
-                  FROM entry_roads er
-                  WHERE er.entry_gid = pe.gid AND er.rn <= 3
-                )
-              )
-            ), '[]'::jsonb)
-            FROM parcel_entries pe
-          ),
-          'administrative_block', (SELECT row_to_json(admin_block.*) FROM admin_block)
-        ) as result
-      `,
-      [lr_no],
-    );
-
-    return result[0]?.result || null;
-  }
-
-  /**
-   * Find closest entry point to origin
-   */
-  private async findClosestEntryPoint(origin: any, entryPoints: any[]) {
-    const distances = await Promise.all(
-      entryPoints.map(async (ep) => {
-        const result = await this.parcelRepo.query(
-          `
-          SELECT ROUND(
-            ST_Distance(
-              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-              ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography
-            )::numeric, 2
-          ) as distance
-          `,
-          [origin.lng, origin.lat, ep.coordinates.lng, ep.coordinates.lat],
-        );
-
-        return { entry: ep, distance: result[0].distance };
-      }),
-    );
-
-    distances.sort((a, b) => a.distance - b.distance);
-    return distances[0].entry;
-  }
-
-  /**
-   * Calculate route from origin to entry point using pgRouting
-   */
-  /**
-   * Calculate route from origin to entry point using simple geometry
-   */
-  private async calculateRouteToEntryPoint(
-    origin: any,
+  private async buildRouteSegments(
+    mapboxRoute: any,
     entryPoint: any,
-    mode: TransportMode,
-  ) {
-    // Get the nearest road segment to origin
-    const startRoad = await this.parcelRepo.query(
-      `
-    SELECT 
-      gid,
-      name,
-      fclass,
-      ST_AsGeoJSON(geom) as geometry,
-      ROUND(ST_Length(geom::geography)::numeric, 2) as distance,
-      ST_Distance(
-        geom::geography,
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
-      ) as distance_to_origin
-    FROM roads
-    WHERE name IS NOT NULL
-    ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)
-    LIMIT 1
-    `,
-      [origin.lng, origin.lat],
-    );
+  ): Promise<RouteSegment[]> {
+    const segments: RouteSegment[] = [];
 
-    // Get the access road for the entry point
-    const accessRoad = entryPoint.nearest_roads[0];
+    const steps = mapboxRoute.legs[0].steps;
 
-    if (!startRoad[0] || !accessRoad) {
-      throw new BadRequestException('Cannot find route - no roads nearby');
-    }
-
-    // If start road and access road are the same, just return that road
-    if (startRoad[0].gid === accessRoad.gid) {
-      return {
-        segments: [
-          {
-            gid: startRoad[0].gid,
-            name: startRoad[0].name,
-            road_type: startRoad[0].fclass,
-            geometry: startRoad[0].geometry,
-            distance: startRoad[0].distance,
-            sequence: 1,
-          },
-        ],
-        total_distance: parseFloat(startRoad[0].distance),
-      };
-    }
-
-    // Otherwise, find intermediate roads
-    const intermediateRoads = await this.parcelRepo.query(
-      `
-    WITH start_point AS (
-      SELECT ST_ClosestPoint(
-        geom,
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)
-      ) as point
-      FROM roads
-      WHERE gid = $3
-    ),
-    end_point AS (
-      SELECT ST_Centroid(geom) as point
-      FROM roads
-      WHERE gid = $4
-    ),
-    connecting_roads AS (
-      SELECT 
-        r.gid,
-        r.name,
-        r.fclass as road_type,
-        ST_AsGeoJSON(r.geom) as geometry,
-        ROUND(ST_Length(r.geom::geography)::numeric, 2) as distance,
-        ST_Distance(
-          r.geom::geography,
-          (SELECT point FROM start_point)::geography
-        ) + ST_Distance(
-          r.geom::geography,
-          (SELECT point FROM end_point)::geography
-        ) as total_distance_score
-      FROM roads r
-      WHERE r.name IS NOT NULL
-        AND r.gid != $3
-        AND r.gid != $4
-        AND ST_DWithin(
-          r.geom::geography,
-          ST_MakeLine(
-            (SELECT point FROM start_point),
-            (SELECT point FROM end_point)
-          )::geography,
-          1000  -- Within 1km of direct line
-        )
-      ORDER BY total_distance_score
-      LIMIT 5
-    )
-    SELECT * FROM connecting_roads
-    ORDER BY total_distance_score
-    `,
-      [origin.lng, origin.lat, startRoad[0].gid, accessRoad.gid],
-    );
-
-    // Build route segments
-    const segments = [
-      {
-        gid: startRoad[0].gid,
-        name: startRoad[0].name,
-        road_type: startRoad[0].fclass,
-        geometry: startRoad[0].geometry,
-        distance: startRoad[0].distance,
-        sequence: 1,
-      },
-    ];
-
-    // Add intermediate roads if any
-    intermediateRoads.forEach((road, index) => {
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
       segments.push({
-        gid: road.gid,
-        name: road.name,
-        road_type: road.road_type,
-        geometry: road.geometry,
-        distance: road.distance,
-        sequence: index + 2,
+        name: step.name || 'Unnamed Road',
+        road_type: step.mode || 'road',
+        geometry: JSON.stringify(step.geometry),
+        distance: Math.round(step.distance),
+        duration: Math.round(step.duration),
+        instruction: step.maneuver?.instruction || `Continue on ${step.name}`,
+        maneuver_type: step.maneuver?.type,
+        maneuver_modifier: step.maneuver?.modifier,
+        sequence: i + 1,
       });
-    });
+    }
 
-    // Add access road
-    const accessRoadData = await this.parcelRepo.query(
-      `
-    SELECT 
-      gid,
-      name,
-      fclass as road_type,
-      ST_AsGeoJSON(geom) as geometry,
-      ROUND(ST_Length(geom::geography)::numeric, 2) as distance
-    FROM roads
-    WHERE gid = $1
-    `,
-      [accessRoad.gid],
-    );
-
-    if (accessRoadData[0]) {
+    const accessRoad = entryPoint.nearest_roads[0];
+    if (accessRoad && entryPoint.distance_to_parcel_meters > 0) {
       segments.push({
-        gid: accessRoadData[0].gid,
-        name: accessRoadData[0].name,
-        road_type: accessRoadData[0].road_type,
-        geometry: accessRoadData[0].geometry,
-        distance: accessRoadData[0].distance,
+        name: `Walk to Entry Point ${entryPoint.label}`,
+        road_type: 'walk',
+        geometry: JSON.stringify({
+          type: 'LineString',
+          coordinates: [
+            [entryPoint.coordinates.lng, entryPoint.coordinates.lat],
+            [entryPoint.coordinates.lng, entryPoint.coordinates.lat],
+          ],
+        }),
+        distance: Math.round(entryPoint.distance_to_parcel_meters),
+        duration: Math.round(entryPoint.distance_to_parcel_meters / 1.4),
+        instruction: `Walk ${Math.round(entryPoint.distance_to_parcel_meters)}m to Entry Point ${entryPoint.label}`,
+        maneuver_type: 'arrive',
         sequence: segments.length + 1,
       });
     }
 
-    const totalDistance = segments.reduce(
-      (sum, seg) => sum + parseFloat(seg.distance.toString()),
-      0,
-    );
-
-    return {
-      segments,
-      total_distance: totalDistance,
-    };
+    return segments;
   }
 
   /**
-   * Generate turn-by-turn instructions
+   * Build turn-by-turn instructions
    */
-  private generateInstructions(
-    segments: any[],
+  private buildInstructions(
+    mapboxRoute: any,
     entryPoint: any,
     parcel: any,
-    mode: TransportMode,
-  ) {
-    const instructions: Array<{
-      step: number;
-      instruction: string;
-      distance: number;
-      type: string;
-      coordinates?: [number, number]; // Add this property
-    }> = [];
-    let cumulativeDistance = 0;
+  ): RouteInstruction[] {
+    const instructions: RouteInstruction[] = [];
+    const steps = mapboxRoute.legs[0].steps;
 
-    // Start instruction
-    instructions.push({
-      step: 1,
-      instruction: `Head towards ${segments[0]?.name || 'the destination'}`,
-      distance: 0,
-      type: 'start',
-    });
-
-    // Road segments
-    segments.forEach((seg, index) => {
-      if (index > 0 && seg.name !== segments[index - 1].name) {
-        cumulativeDistance += parseFloat(seg.distance);
-        instructions.push({
-          step: instructions.length + 1,
-          instruction: `Continue on ${seg.name}`,
-          distance: parseFloat(seg.distance),
-          type: 'continue',
-        });
-      }
-    });
-
-    // Arrival at entry point
-    const accessRoad = entryPoint.nearest_roads[0];
-    if (accessRoad) {
+    steps.forEach((step: any, index: number) => {
       instructions.push({
-        step: instructions.length + 1,
-        instruction: `Turn onto ${accessRoad.name}`,
-        distance: accessRoad.distance_meters,
-        type: 'turn',
+        step: index + 1,
+        instruction: step.maneuver?.instruction || `Continue on ${step.name}`,
+        distance: Math.round(step.distance),
+        duration: Math.round(step.duration),
+        type: step.maneuver?.type || 'continue',
+        modifier: step.maneuver?.modifier,
+        coordinates: {
+          lat: step.maneuver?.location?.[1] || 0,
+          lng: step.maneuver?.location?.[0] || 0,
+        },
+        road_name: step.name || 'Unnamed Road',
       });
-    }
-
-    // Final instruction
-    const walkDistance = entryPoint.distance_to_parcel_meters;
-    instructions.push({
-      step: instructions.length + 1,
-      instruction: `Walk ${walkDistance.toFixed(0)}m to Entry Point ${entryPoint.label}`,
-      distance: walkDistance,
-      type: 'walk',
-      coordinates: entryPoint.coordinates,
     });
 
     instructions.push({
       step: instructions.length + 1,
-      instruction: `You have arrived at ${parcel.lr_no}`,
+      instruction: `You have arrived at ${parcel.lr_no} - Entry Point ${entryPoint.label}`,
       distance: 0,
-      type: 'arrival',
+      duration: 0,
+      type: 'arrive',
       coordinates: entryPoint.coordinates,
+      road_name: '',
     });
 
     return instructions;
   }
 
-  /**
-   * Generate physical address
-   */
+  private getTrafficLevel(
+    congestion: any,
+  ): 'low' | 'moderate' | 'heavy' | 'unknown' {
+    if (!congestion || !Array.isArray(congestion) || congestion.length === 0) {
+      return 'unknown';
+    }
+
+    const congestionCounts = {
+      low: 0,
+      moderate: 0,
+      heavy: 0,
+      severe: 0,
+    };
+
+    congestion.forEach((level: string) => {
+      if (level in congestionCounts) {
+        congestionCounts[level as keyof typeof congestionCounts]++;
+      }
+    });
+
+    if (
+      congestionCounts.severe > 0 ||
+      congestionCounts.heavy > congestion.length / 2
+    ) {
+      return 'heavy';
+    } else if (congestionCounts.moderate > congestion.length / 3) {
+      return 'moderate';
+    }
+    return 'low';
+  }
+
+  private async getParcelWithEntryPoints(lr_no: string) {
+    // Get parcel
+    const parcel = await this.parcelRepo.findOne({ where: { lr_no } });
+    if (!parcel) {
+      return null;
+    }
+
+    // Get entry points within 1000 meters of the parcel
+    const entryPointsRaw = await this.entryPointRepo.query(
+      `
+      SELECT
+        ep.gid,
+        ep.label,
+        ST_X(ST_Transform(ep.geom, 4326)) as lng,
+        ST_Y(ST_Transform(ep.geom, 4326)) as lat,
+        ROUND(ST_Distance(ep.geom::geography, p.geom::geography)::numeric, 2) AS distance_to_parcel_meters
+      FROM entry_points ep, land_parcel p
+      WHERE p.lr_no = $1 AND ST_Distance(ep.geom::geography, p.geom::geography) < 1000
+      ORDER BY distance_to_parcel_meters
+    `,
+      [lr_no],
+    );
+
+    // Transform to expected format
+    const entry_points = entryPointsRaw.map((ep) => ({
+      gid: ep.gid,
+      label: ep.label,
+      coordinates: { lat: parseFloat(ep.lat), lng: parseFloat(ep.lng) },
+      distance_to_parcel_meters: parseFloat(ep.distance_to_parcel_meters),
+      nearest_roads: [], // TODO: implement nearest roads
+    }));
+
+    // Get administrative block containing the parcel
+    const adminBlock = await this.adminBlockRepo.query(
+      `
+      SELECT * FROM administrative_block
+      WHERE ST_Contains(geom, (SELECT geom FROM land_parcel WHERE lr_no = $1))
+      LIMIT 1
+    `,
+      [lr_no],
+    );
+
+    const administrative_block = adminBlock[0] || null;
+
+    return {
+      parcel,
+      entry_points,
+      administrative_block,
+    };
+  }
+
   private generatePhysicalAddress(
     parcel: any,
     adminBlock: any,
     accessRoad: any,
-  ) {
+  ): string {
     const parts: string[] = [];
 
-    if (parcel.lr_no) {
-      parts.push(`Parcel ${parcel.lr_no}`);
-    }
-
-    if (accessRoad?.name) {
-      parts.push(`off ${accessRoad.name}`);
-    }
-
-    if (adminBlock?.name) {
-      parts.push(adminBlock.name);
-    }
-
-    if (adminBlock?.constituen) {
-      parts.push(adminBlock.constituen);
-    }
+    if (parcel.lr_no) parts.push(`Parcel ${parcel.lr_no}`);
+    if (accessRoad?.name) parts.push(`off ${accessRoad.name}`);
+    if (adminBlock?.name) parts.push(adminBlock.name);
+    if (adminBlock?.constituen) parts.push(adminBlock.constituen);
 
     return parts.join(', ') || 'Address not available';
   }

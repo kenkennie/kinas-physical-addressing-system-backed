@@ -1,10 +1,12 @@
+// src/routing/dto/route.dto.ts
 import {
-  IsEnum,
   IsNotEmpty,
   IsNumber,
+  IsEnum,
   IsOptional,
-  IsString,
   ValidateNested,
+  Min,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
@@ -17,17 +19,20 @@ export enum TransportMode {
 
 export class CoordinateDto {
   @IsNumber()
+  @Min(-90)
+  @Max(90)
   lat: number;
 
   @IsNumber()
+  @Min(-180)
+  @Max(180)
   lng: number;
 }
 
 export class CalculateRouteDto {
   @IsNotEmpty()
-  gid: number;
-
-  @IsNotEmpty()
+  @ValidateNested()
+  @Type(() => CoordinateDto)
   origin: CoordinateDto;
 
   @IsNotEmpty()
@@ -38,15 +43,32 @@ export class CalculateRouteDto {
 
   @IsOptional()
   @IsNumber()
-  preferred_entry_point?: number; // Entry point GID
+  preferred_entry_point?: number;
 }
 
 export class AlternativeRoutesDto {
   @IsNotEmpty()
+  @ValidateNested()
+  @Type(() => CoordinateDto)
   origin: CoordinateDto;
 
   @IsNotEmpty()
   destination_lr_no: string;
+
+  @IsEnum(TransportMode)
+  mode: TransportMode;
+}
+
+export class RoutePreviewDto {
+  @IsNotEmpty()
+  @ValidateNested()
+  @Type(() => CoordinateDto)
+  origin: CoordinateDto;
+
+  @IsNotEmpty()
+  @ValidateNested()
+  @Type(() => CoordinateDto)
+  destination: CoordinateDto;
 
   @IsEnum(TransportMode)
   mode: TransportMode;
