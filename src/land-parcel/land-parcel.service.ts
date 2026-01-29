@@ -24,8 +24,7 @@ export class LandParcelService {
     mvtgeom AS (
       SELECT 
         ST_AsMVTGeom(
-          -- Transform from EPSG:4326 to EPSG:3857 (Web Mercator)
-          ST_Transform(p.geom, 3857), 
+          ST_Transform(p.geometry, 3857), 
           bounds.geom,
           4096,
           256,
@@ -36,11 +35,44 @@ export class LandParcelService {
         p.fr_no,
         p.area,
         p.objectid,
-        p.entity
-      FROM land_parcel p, bounds
+        -- Create the complete label only when all parts exist
+        CASE 
+          WHEN ab.name IS NOT NULL 
+               AND ab.constituen IS NOT NULL 
+               AND ab.county_nam IS NOT NULL 
+               AND p.lr_no IS NOT NULL THEN
+            CONCAT(
+              -- Extract last part of lr_no (after last slash)
+              SPLIT_PART(p.lr_no, '/', ARRAY_LENGTH(STRING_TO_ARRAY(p.lr_no, '/'), 1)),
+              '/',
+              UPPER(TRIM(ab.name)),
+              '/',
+              UPPER(TRIM(ab.constituen)),
+              '/',
+              UPPER(TRIM(ab.county_nam))
+            )
+          WHEN p.lr_no IS NOT NULL THEN
+            -- Fallback to just the parcel number if admin data is missing
+            SPLIT_PART(p.lr_no, '/', ARRAY_LENGTH(STRING_TO_ARRAY(p.lr_no, '/'), 1))
+          ELSE
+            NULL -- Don't show label if lr_no is missing
+        END AS parcel_label
+      FROM land_parcel p
+      CROSS JOIN bounds
+      -- Spatial join with administrative_block - use LATERAL for better performance
+      LEFT JOIN LATERAL (
+        SELECT 
+          ab.name,
+          ab.constituen,
+          ab.county_nam
+        FROM administrative_block ab
+        WHERE ST_Intersects(p.geometry, ab.geometry)
+        -- If parcel crosses multiple blocks, pick the one with largest overlap
+        ORDER BY ST_Area(ST_Intersection(p.geometry, ab.geometry)) DESC
+        LIMIT 1
+      ) ab ON true
       WHERE ST_Intersects(
-        -- Transform geometry for intersection test
-        ST_Transform(p.geom, 3857),
+        ST_Transform(p.geometry, 3857),
         bounds.geom
       )
     )
