@@ -16,7 +16,7 @@ export class LandParcelService {
     private readonly addressService: AddressService,
   ) {}
 
-  async generateTile(z: number, x: number, y: number) {
+  async generateTile_2(z: number, x: number, y: number) {
     const result = await this.parcelRepo.query(
       `WITH bounds AS (
       SELECT ST_TileEnvelope($1, $2, $3) AS geom
@@ -24,7 +24,7 @@ export class LandParcelService {
     mvtgeom AS (
       SELECT 
         ST_AsMVTGeom(
-          ST_Transform(p.geometry, 3857), 
+          ST_Transform(p.geom, 3857), 
           bounds.geom,
           4096,
           256,
@@ -83,6 +83,54 @@ export class LandParcelService {
     );
 
     return result[0]?.tile || Buffer.alloc(0);
+  }
+
+  // Function to generate land parcel tiles with administrative data
+  async generateTile(z: number, x: number, y: number) {
+    try {
+      const result = await this.parcelRepo.query(
+        `WITH bounds AS (
+         SELECT ST_TileEnvelope($1, $2, $3) AS geom
+       ),
+       mvtgeom AS (
+         SELECT 
+           ST_AsMVTGeom(
+             ST_Transform(p.geom, 3857), 
+             bounds.geom,
+             4096, 
+             256, 
+             true
+           ) AS geom,
+           p.gid,
+           p.lr_no,
+           p.area,
+           a.short_name,
+        -- logic: Take "short_name" + "/" + everything after the first slash in "lr_no"
+        CONCAT(COALESCE(a.short_name, 'UNK'), '/', SPLIT_PART(p.lr_no, '/', 2)) AS display_label
+         FROM land_parcel p
+         JOIN bounds ON ST_Intersects(ST_Transform(p.geom, 3857), bounds.geom)
+         LEFT JOIN LATERAL (
+           SELECT short_name 
+           FROM administrative_block ab 
+           WHERE ST_Intersects(p.geom, ab.geom) 
+           LIMIT 1
+         ) a ON true
+       )
+       SELECT ST_AsMVT(mvtgeom.*, 'parcels', 4096, 'geom') AS tile
+       FROM mvtgeom`,
+        [z, x, y],
+      );
+
+      // FIXED: TypeORM returns the array directly. No ".rows" needed.
+      if (result && result.length > 0) {
+        return result[0].tile || Buffer.alloc(0);
+      }
+
+      return Buffer.alloc(0);
+    } catch (error) {
+      console.error('Error generating tile:', error);
+      return Buffer.alloc(0);
+    }
   }
 
   async getParcelDetailsByLatLng(lat: number, lng: number) {
@@ -167,7 +215,7 @@ export class LandParcelService {
     ),
 
     admin_block AS (
-      SELECT a.gid, a.name, a.constituen, a.county_nam
+      SELECT a.gid, a.name, a.constituen, a.county_nam, a.short_name
       FROM administrative_block a, parcel_info p
       WHERE ST_Intersects(a.geom, p.geom)
       LIMIT 1

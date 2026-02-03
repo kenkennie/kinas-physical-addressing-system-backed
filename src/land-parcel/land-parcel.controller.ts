@@ -33,11 +33,8 @@ export class LandParcelController {
       }
 
       // Log the request
-      console.log(`Tile request: z=${zNum}, x=${xNum}, y=${yNum}`);
 
       const tile = await this.landParcelService.generateTile(zNum, xNum, yNum);
-
-      console.log('Generated tile size:', tile ? tile.length : 'null or 0');
 
       // Always return something (empty tile if no data)
       res.setHeader('Content-Type', 'application/vnd.mapbox-vector-tile');

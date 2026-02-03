@@ -23,6 +23,9 @@ export class AdministrativeBlock {
   @Column({ type: 'varchar', length: 255 })
   county_nam: string;
 
+  @Column({ type: 'varchar', length: 20 })
+  short_name: string;
+
   @Column('decimal', { precision: 15, scale: 3 })
   shape_area: number;
 
