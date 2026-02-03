@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { Response } from 'express';
 import { LandParcelService } from './land-parcel.service';
+import { SearchAddressDto, SuggestionsQueryDto } from './dto/searchDto';
 
 @Controller('land-parcel')
 export class LandParcelController {
@@ -94,13 +95,13 @@ export class LandParcelController {
     return this.landParcelService.getAllParcels(pageNum, limitNum);
   }
 
-  // Optional: Search parcels by LR number
-  @Get('search/lr-no')
-  async searchParcelsByLrNo(@Query('q') query: string) {
-    if (!query || query.length < 2) {
-      return { error: 'Query must be at least 2 characters' };
-    }
+  @Post('search')
+  async searchAddress(@Body() searchDto: SearchAddressDto) {
+    return await this.landParcelService.searchAddress(searchDto);
+  }
 
-    return this.landParcelService.searchParcelsByLrNo(query);
+  @Get('suggestions')
+  async getSuggestions(@Query() query: SuggestionsQueryDto) {
+    return await this.landParcelService.getSuggestions(query.q, query.limit);
   }
 }
