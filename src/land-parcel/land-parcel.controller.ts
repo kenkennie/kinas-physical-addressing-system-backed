@@ -1,13 +1,4 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Param,
-  Post,
-  Query,
-  Res,
-  ParseIntPipe,
-} from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { LandParcelService } from './land-parcel.service';
 import { SearchAddressDto, SuggestionsQueryDto } from './dto/searchDto';
@@ -74,14 +65,27 @@ export class LandParcelController {
     return this.landParcelService.getParcelDetailsByLatLng(body.lat, body.lng);
   }
 
-  // @Get(':gid')
-  // async getParcelDetailsByGid(@Param('gid') gid: string) {
-  //   const gidNum = parseInt(gid);
-  //   if (isNaN(gidNum)) {
-  //     return { error: 'Invalid GID' };
-  //   }
-  //   return this.landParcelService.getParcelDetailsByLatLng(gidNum);
-  // }
+  @Get('suggestions')
+  async getSuggestions(@Query() query: SuggestionsQueryDto) {
+    return await this.landParcelService.getSuggestions(
+      query.q,
+      query.limit || 5,
+    );
+  }
+
+  @Post('search')
+  async searchAddress(@Body() searchDto: SearchAddressDto) {
+    return await this.landParcelService.searchAddress(searchDto);
+  }
+
+  @Get(':gid')
+  async getParcelDetailsByGid(@Param('gid') gid: string) {
+    const parsedGid = parseInt(gid, 10);
+    if (isNaN(parsedGid)) {
+      return { error: 'Invalid GID' };
+    }
+    return await this.landParcelService.getParcelContextByGid(parsedGid);
+  }
 
   // Optional: Get all parcels (paginated)
   @Get()
@@ -93,15 +97,5 @@ export class LandParcelController {
     const limitNum = limit ? parseInt(limit) : 50;
 
     return this.landParcelService.getAllParcels(pageNum, limitNum);
-  }
-
-  @Post('search')
-  async searchAddress(@Body() searchDto: SearchAddressDto) {
-    return await this.landParcelService.searchAddress(searchDto);
-  }
-
-  @Get('suggestions')
-  async getSuggestions(@Query() query: SuggestionsQueryDto) {
-    return await this.landParcelService.getSuggestions(query.q, query.limit);
   }
 }

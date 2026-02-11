@@ -17,7 +17,6 @@ export class LandParcelService {
     private readonly addressService: AddressService,
   ) {}
 
-  // Function to generate land parcel tiles with administrative data
   async generateTile(z: number, x: number, y: number) {
     try {
       const result = await this.parcelRepo.query(
@@ -208,14 +207,14 @@ export class LandParcelService {
     let parameters: any[] = [];
     let paramIndex = 1;
 
-    // Search by LR number (partial match, case-insensitive)
+    // Search by LR number
     if (lr_no) {
       whereConditions.push(`lp.lr_no ILIKE $${paramIndex}`);
       parameters.push(`%${lr_no}%`);
       paramIndex++;
     }
 
-    // Search by physical address (if you have this field)
+    // Search by physical address
     if (physical_address) {
       whereConditions.push(
         `(ab.name ILIKE $${paramIndex} OR ab.constituen ILIKE $${paramIndex} OR ab.county_nam ILIKE $${paramIndex})`,
@@ -228,10 +227,10 @@ export class LandParcelService {
     if (lat && lng && radius) {
       whereConditions.push(
         `ST_DWithin(
-          lp.geom::geography,
-          ST_SetSRID(ST_MakePoint($${paramIndex}, $${paramIndex + 1}), 4326)::geography,
-          $${paramIndex + 2}
-        )`,
+        lp.geom::geography,
+        ST_SetSRID(ST_MakePoint($${paramIndex}, $${paramIndex + 1}), 4326)::geography,
+        $${paramIndex + 2}
+      )`,
       );
       parameters.push(lng, lat, radius);
       paramIndex += 3;
@@ -242,162 +241,48 @@ export class LandParcelService {
         ? `WHERE ${whereConditions.join(' AND ')}`
         : '';
 
+    // ──────────────────────────────────────────────────────────────────────
+    // SIMPLIFIED: Just find matching GIDs, then delegate to getParcelContextByGid
+    // ──────────────────────────────────────────────────────────────────────
     const query = `
-      WITH parcel_search AS (
-        SELECT
-          lp.gid,
-          lp.lr_no,
-          lp.fr_no,
-          CAST(lp.area AS FLOAT) AS area,
-          lp.entity,
-          lp.geom,
-          ST_Y(ST_Centroid(lp.geom)) AS centroid_lat,
-          ST_X(ST_Centroid(lp.geom)) AS centroid_lng,
-          ab.gid AS admin_gid,
-          ab.name AS admin_name,
-          ab.constituen AS admin_constituen,
-          ab.county_nam AS admin_county,
-          ab.short_name AS admin_short_name
-        FROM land_parcel lp
-        LEFT JOIN administrative_block ab ON ST_Intersects(ab.geom, lp.geom)
-        ${whereClause}
-        ORDER BY 
-          CASE 
-            WHEN lp.lr_no ILIKE $${parameters.length + 1} THEN 0
-            ELSE 1
-          END,
-          lp.gid
-        LIMIT 20
-      ),
-
-      parcel_entries AS (
-        SELECT
-          ps.gid AS parcel_gid,
-          e.gid AS entry_gid,
-          e.label AS entry_label,
-          ST_Y(e.geom) AS entry_lat,
-          ST_X(e.geom) AS entry_lng,
-          ROUND(ST_Distance(e.geom::geography, ps.geom::geography)::numeric, 2) AS distance_to_parcel,
-          ROW_NUMBER() OVER (
-            PARTITION BY ps.gid
-            ORDER BY ST_Distance(e.geom::geography, ps.geom::geography)
-          ) AS rn
-        FROM parcel_search ps
-        LEFT JOIN entry_points e ON ST_DWithin(e.geom::geography, ps.geom::geography, 50)
-      ),
-
-      entry_roads AS (
-        SELECT
-          pe.entry_gid,
-          r.gid AS road_gid,
-          r.name AS road_name,
-          r.fclass AS road_fclass,
-          r.ref AS road_ref,
-          ROUND(ST_Distance(r.geom::geography, pe.geom::geography)::numeric, 2) AS distance_meters,
-          ROW_NUMBER() OVER (
-            PARTITION BY pe.entry_gid
-            ORDER BY ST_Distance(r.geom::geography, pe.geom::geography)
-          ) AS road_rn
-        FROM (
-          SELECT entry_gid, ST_SetSRID(ST_MakePoint(entry_lng, entry_lat), 4326) as geom
-          FROM parcel_entries
-          WHERE rn <= 3
-        ) pe
-        LEFT JOIN roads r ON ST_DWithin(r.geom::geography, pe.geom::geography, 100)
-      )
-
-      SELECT
-        json_build_object(
-          'parcel', json_build_object(
-            'gid', ps.gid,
-            'lr_no', ps.lr_no,
-            'fr_no', ps.fr_no,
-            'area', ps.area,
-            'entity', ps.entity
-          ),
-          'latlng', json_build_object(
-            'lat', ps.centroid_lat,
-            'lng', ps.centroid_lng
-          ),
-          'centroid', json_build_object(
-            'lat', ps.centroid_lat,
-            'lng', ps.centroid_lng
-          ),
-          'administrative_block', CASE
-            WHEN ps.admin_gid IS NOT NULL THEN
-              json_build_object(
-                'gid', ps.admin_gid,
-                'name', ps.admin_name,
-                'constituen', ps.admin_constituen,
-                'county_nam', ps.admin_county,
-                'short_name', ps.admin_short_name
-              )
-            ELSE NULL
-          END,
-          'entry_points', COALESCE(
-            (
-              SELECT json_agg(
-                json_build_object(
-                  'gid', pe.entry_gid,
-                  'label', pe.entry_label,
-                  'coordinates', json_build_object(
-                    'lat', pe.entry_lat,
-                    'lng', pe.entry_lng
-                  ),
-                  'distance_to_parcel_meters', pe.distance_to_parcel,
-                  'nearest_roads', COALESCE(
-                    (
-                      SELECT json_agg(
-                        json_build_object(
-                          'gid', er.road_gid,
-                          'name', er.road_name,
-                          'fclass', er.road_fclass,
-                          'ref', er.road_ref,
-                          'distance_meters', er.distance_meters
-                        )
-                        ORDER BY er.distance_meters
-                      )
-                      FROM entry_roads er
-                      WHERE er.entry_gid = pe.entry_gid AND er.road_rn <= 3
-                    ),
-                    '[]'::json
-                  )
-                )
-              )
-              FROM parcel_entries pe
-              WHERE pe.parcel_gid = ps.gid AND pe.rn <= 3
-            ),
-            '[]'::json
-          ),
-          'nearby_roads', '[]'::json
-        ) AS result
-      FROM parcel_search ps
-    `;
+    SELECT lp.gid
+    FROM land_parcel lp
+    LEFT JOIN administrative_block ab ON ST_Intersects(ab.geom, lp.geom)
+    ${whereClause}
+    ORDER BY 
+      CASE 
+        WHEN lp.lr_no ILIKE $${parameters.length + 1} THEN 0
+        ELSE 1
+      END,
+      lp.gid
+    LIMIT 20
+  `;
 
     // Add the exact match parameter for ordering
     parameters.push(lr_no ? `${lr_no}%` : '');
 
-    const results = await this.parcelRepo.query(query, parameters);
-    return results.map((row) => row.result);
+    const gidResults = await this.parcelRepo.query(query, parameters);
+
+    // Fetch full details for each GID using our single source of truth
+    const parcelDetails = await Promise.all(
+      gidResults.map((row) => this.getParcelContextByGid(parseInt(row.gid))),
+    );
+
+    // Filter out any nulls (shouldn't happen, but defensive)
+    return parcelDetails.filter((p) => p !== null);
   }
 
-  // FILE PATH: backend/src/services/parcel.service.ts
-
-  /**
-   * Get rich search suggestions with parcel details + GID
-   * The GID allows us to skip searchAddress and go straight to getParcelContextByGid
-   * when the user taps a suggestion.
-   */
   async getSuggestions(
     query: string,
     limit: number = 5,
   ): Promise<
     Array<{
-      gid: number; // ← ADDED: for fast direct lookup
+      gid: number;
       lr_no: string;
       short_name: string | null;
       area: number;
       constituency: string | null;
+      administrative_name: string | null;
     }>
   > {
     if (!query || query.length < 2) {
@@ -407,15 +292,16 @@ export class LandParcelService {
     const results = await this.parcelRepo.query(
       `
     SELECT 
-      p.gid,                -- ← ADDED
+      p.gid,
       p.lr_no,
       p.area,
       a.short_name,
       a.constituen AS constituency,
+      a.name AS administrative_name,
       CASE WHEN p.lr_no ILIKE $2 THEN 0 ELSE 1 END AS priority
     FROM land_parcel p
     LEFT JOIN LATERAL (
-      SELECT short_name, constituen
+      SELECT short_name, constituen, name
       FROM administrative_block ab
       WHERE ST_Intersects(p.geom, ab.geom)
       LIMIT 1
@@ -433,6 +319,7 @@ export class LandParcelService {
       short_name: row.short_name,
       area: parseFloat(row.area),
       constituency: row.constituency,
+      administrative_name: row.administrative_name,
     }));
   }
 
