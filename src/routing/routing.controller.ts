@@ -10,6 +10,7 @@ import {
   Query,
   BadRequestException,
 } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiQuery, ApiBody } from '@nestjs/swagger';
 import { RoutingService } from './routing.service';
 import { MapboxService } from './mapbox.service';
 import {
@@ -19,6 +20,7 @@ import {
 } from './dto/routing.dto';
 import { RouteResponse } from './types/route.types';
 
+@ApiTags('routing')
 @Controller('routing')
 export class RoutingController {
   constructor(
@@ -28,6 +30,24 @@ export class RoutingController {
 
   @Post('calculate')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Calculate route to a land parcel',
+    description:
+      'Calculates the optimal route from origin coordinates to a land parcel identified by LR number. Resolves the best entry point and returns turn-by-turn instructions.',
+  })
+  @ApiBody({
+    type: CalculateRouteDto,
+    examples: {
+      driving: {
+        summary: 'Driving route',
+        value: {
+          origin: { lat: -1.2921, lng: 36.8219 },
+          destination_lr_no: '1/136',
+          mode: 'driving',
+        },
+      },
+    },
+  })
   async calculateRoute(
     @Body(ValidationPipe) dto: CalculateRouteDto,
   ): Promise<RouteResponse> {
@@ -36,6 +56,24 @@ export class RoutingController {
 
   @Post('alternatives')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get alternative routes to a land parcel',
+    description:
+      'Returns multiple route options to a land parcel, one per available entry point, so the user can choose the most convenient access.',
+  })
+  @ApiBody({
+    type: AlternativeRoutesDto,
+    examples: {
+      driving: {
+        summary: 'Alternative driving routes',
+        value: {
+          origin: { lat: -1.2921, lng: 36.8219 },
+          destination_lr_no: '1/136',
+          mode: 'driving',
+        },
+      },
+    },
+  })
   async getAlternativeRoutes(
     @Body(ValidationPipe) dto: AlternativeRoutesDto,
   ): Promise<RouteResponse[]> {
@@ -43,6 +81,13 @@ export class RoutingController {
   }
 
   @Get('road-name')
+  @ApiOperation({
+    summary: 'Get road name at coordinates',
+    description:
+      'Uses Mapbox reverse geocoding to return the name of the road nearest to the given coordinates.',
+  })
+  @ApiQuery({ name: 'lat', description: 'Latitude', example: -1.2868 })
+  @ApiQuery({ name: 'lng', description: 'Longitude', example: 36.8249 })
   async getRoadName(@Query('lat') lat: string, @Query('lng') lng: string) {
     if (!lat || !lng) {
       throw new BadRequestException('Latitude and longitude are required');
@@ -65,6 +110,20 @@ export class RoutingController {
 
   @Post('preview')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Quick route preview',
+    description:
+      'Returns a lightweight route summary (distance and duration) between two coordinate pairs without full turn-by-turn instructions.',
+  })
+  @ApiBody({
+    schema: {
+      example: {
+        origin: { lat: -1.2921, lng: 36.8219 },
+        destination: { lat: -1.2868, lng: 36.8249 },
+        mode: 'driving',
+      },
+    },
+  })
   async getRoutePreview(
     @Body(ValidationPipe)
     dto: {
@@ -93,9 +152,14 @@ export class RoutingController {
   }
 
   @Get('health')
+  @ApiOperation({
+    summary: 'Check Mapbox connection health',
+    description:
+      'Verifies the Mapbox API is reachable and the token is valid by running a test route calculation.',
+  })
   async checkHealth() {
     try {
-      const testRoute = await this.mapboxService.getRoute(
+      await this.mapboxService.getRoute(
         { lat: -1.2921, lng: 36.8219 },
         { lat: -1.2864, lng: 36.8172 },
         'driving',

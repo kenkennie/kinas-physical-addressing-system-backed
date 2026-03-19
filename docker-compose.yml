@@ -1,0 +1,53 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: anwani-api
+    restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:3000'
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-anwani}
+      DB_PASSWORD: ${DB_PASSWORD:-anwani_secret}
+      DB_NAME: ${DB_NAME:-anwani_db}
+      MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN}
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - anwani-network
+
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: anwani-postgres
+    restart: unless-stopped
+    ports:
+      - '${DB_PORT_HOST:-5432}:5432'
+    environment:
+      POSTGRES_USER: ${DB_USER:-anwani}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-anwani_secret}
+      POSTGRES_DB: ${DB_NAME:-anwani_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-anwani} -d ${DB_NAME:-anwani_db}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - anwani-network
+
+volumes:
+  postgres_data:
+
+networks:
+  anwani-network:
+    driver: bridge

@@ -1,8 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { EntryPointsModule } from './entry-points/entry-points.module';
 import { AdministrativeBlockModule } from './administrative-block/administrative-block.module';
 import { LandParcelModule } from './land-parcel/land-parcel.module';
@@ -29,7 +27,5 @@ import { databaseConfig } from './config/database.config';
     AddressModule,
     RoutingModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}
